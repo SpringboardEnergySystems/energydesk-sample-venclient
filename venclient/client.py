@@ -201,10 +201,12 @@ class VENClient:
     async def poll_events(self) -> List[EventData]:
         """Poll for new events from the VTN"""
         try:
+            logger.info(f"Polling for events for {self.vtn_base_url}/events")
             async with self.session.get(
                 f"{self.vtn_base_url}/events",
                 headers=self._get_auth_headers()
             ) as response:
+                print(response.status)
                 if response.status == 200:
                     events_data = await response.json()
                     events = []
@@ -231,6 +233,7 @@ class VENClient:
                     return []
 
         except Exception as e:
+            print(e)
             logger.error(f"Error polling events for {self.config.ven_name}: {str(e)}")
             return []
 
@@ -328,6 +331,8 @@ class VENManager:
         self.vtn_base_url = vtn_base_url
         self.vens: Dict[str, VENClient] = {}
         self.program_id: Optional[str] = None
+        self._stop_polling = threading.Event()  # Flag to signal thread termination
+        self.poll_thread: Optional[threading.Thread] = None
 
     def load_ven_resources(self):
         data=json.loads(open('config/resources.json').read())
@@ -517,26 +522,24 @@ class VENManager:
                     error_text = await response.text()
                     raise Exception(f"Failed to create test event: {error_text}")
 
-    async def run_event_polling_loop(self, duration_minutes: int = 5):
-        """Run continuous event polling for all VENs"""
-        logger.info(f"Starting event polling loop for {duration_minutes} minutes...")
 
-        start_time = time.time()
-        while time.time() - start_time < duration_minutes * 60:
+    async def run_event_polling_loop(self, polling_seconds_frequency: int = 15):
+        """Run continuous event polling for all VENs"""
+        logger.info(f"Starting event polling loop for every {polling_seconds_frequency} seconds...")
+
+        while not self._stop_polling.is_set():
             # Poll events for all VENs
             polling_tasks = []
             for ven in self.vens.values():
                 if ven.credentials:
                     polling_tasks.append(ven.poll_events())
-
             if polling_tasks:
                 results = await asyncio.gather(*polling_tasks, return_exceptions=True)
-
                 # Process events and generate responses
                 response_tasks = []
                 for i, events in enumerate(results):
                     if isinstance(events, list) and events:
-                        ven = self.vens.values()[i]
+                        ven = list(self.vens.values())[i]  # Fix the indexing issue
                         for event in events:
                             # Generate intelligent response
                             response_type = ven.get_smart_response(event)
@@ -546,8 +549,17 @@ class VENManager:
                 if response_tasks:
                     await asyncio.gather(*response_tasks, return_exceptions=True)
 
-            # Wait before next poll
-            await asyncio.sleep(30)  # Poll every 30 seconds
+            # Check if we should stop before waiting
+            if self._stop_polling.is_set():
+                break
+
+            # Wait before next poll with periodic check for stop signal
+            for _ in range(polling_seconds_frequency):
+                if self._stop_polling.is_set():
+                    break
+                await asyncio.sleep(1)
+
+        logger.info("Event polling loop terminated gracefully")
 
     async def generate_reports(self):
         """Generate telemetry reports for all VENs"""
@@ -602,27 +614,47 @@ class VENManager:
 
         print("\n" + "=" * 80)
 
+    # Start thread for async polling against VTN server
     def run_async_polling(self):
-        """Run the async polling in a separate thread"""
-
         def poll_worker():
-            # Create new event loop for this thread
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-
+            # Re-create VENs in this loop
+            for ven in self.vens.values():
+                loop.run_until_complete(ven.__aenter__())
             try:
-                # Run the continuous polling
-                loop.run_until_complete(
-                    self.run_event_polling_loop(duration_minutes=2)
-                )
+                loop.run_until_complete(self.run_event_polling_loop(polling_seconds_frequency=15))
             finally:
+                loop.run_until_complete(self.cleanup())
                 loop.close()
 
         self.poll_thread = threading.Thread(target=poll_worker, daemon=True)
         self.poll_thread.start()
         logger.info("Started async polling thread")
 
-    import asyncio
+    def stop_polling(self):
+        """Signal the polling thread to stop gracefully"""
+        logger.info("Signaling polling thread to stop...")
+        self._stop_polling.set()
+
+    def wait_for_polling_to_stop(self, timeout: Optional[float] = 30.0):
+        """Wait for the polling thread to stop gracefully"""
+        if self.poll_thread and self.poll_thread.is_alive():
+            logger.info("Waiting for polling thread to stop...")
+            self.poll_thread.join(timeout=timeout)
+            if self.poll_thread.is_alive():
+                logger.warning("Polling thread did not stop within timeout period")
+                return False
+            else:
+                logger.info("Polling thread stopped successfully")
+                return True
+        return True
+
+    def is_polling_active(self) -> bool:
+        """Check if polling is currently active"""
+        return self.poll_thread is not None and self.poll_thread.is_alive() and not self._stop_polling.is_set()
+
+
     def ven_report_usage(self) -> bool:
         """
         Placeholder for the VEN update logic.
@@ -692,7 +724,10 @@ async def startup(ven_id="testven",vtn_url="http://localhost:8000", resource_map
 
         # Step 5: Run event polling loop
         print("\n5. Starting event polling and response loop...")
+
         manager.run_async_polling()  # Run for 2 minutes
+
+
         while manager.poll_thread.is_alive():
             schedule.run_pending()
             time.sleep(1)
