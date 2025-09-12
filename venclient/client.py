@@ -705,38 +705,26 @@ async def startup(ven_id="testven",vtn_url="http://localhost:8000", resource_map
     manager = VENManager(vtn_base_url=vtn_url)
     await init_scheduler(manager)
     try:
-        # Step 1: Create a test program
-        logger.info("Loading available programs")
 
 
-        # Step 2: Register all VENs
-        print("\n2. Registering VEN instances...")
+        # Step 1: Register all VENs
+        print("\n1. Login as VEN and register Resource (Asset) instances...")
         await manager.register_ven_and_resources(ven_id, resource_map)
-        print("\n3. Loading programs for ven:", ven_id)
+        print("\n2. Loading programs for ven:", ven_id)
         await manager.load_programs(ven_id)
-        # Step 3: Generate initial reports
-        #print("\n3. Generating initial telemetry reports...")
-        #await manager.generate_reports()
+        print("\n3. Starting event polling and response loop...")
 
-        # Step 4: Create a test event
-        #print("\n4. Creating test demand response event...")
-        #event_id = await manager.create_test_event()
-
-        # Step 5: Run event polling loop
-        print("\n5. Starting event polling and response loop...")
-
-        manager.run_async_polling()  # Run for 2 minutes
-
+        manager.run_async_polling()  # Start polling VTN in a separate thread
 
         while manager.poll_thread.is_alive():
-            schedule.run_pending()
+            schedule.run_pending()  # This scheduler checks status on Resources and generates reports to VTN
             time.sleep(1)
         # Step 6: Generate final reports
         #   print("\n6. Generating final reports...")
         #await manager.generate_reports()
 
         # Step 7: Print summary
-        manager.print_summary()
+        #manager.print_summary()
 
     except Exception as e:
         logger.error(f"Application error: {str(e)}")
