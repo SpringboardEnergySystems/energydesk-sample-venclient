@@ -16,6 +16,7 @@ import time
 import threading
 import environ
 import os
+from .utils import get_environment_value, camel_to_snake, get_access_token
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -25,16 +26,7 @@ logger = logging.getLogger(__name__)
 
 import re
 
-def get_environment_value(parameter, default):
-    env = environ.Env()
-    outvalue = default
-    if parameter in os.environ:
-        outvalue = env(parameter)
-    return outvalue
 
-def camel_to_snake(name):
-    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
-    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
 
 # Enums for OpenADR 3.0.1
 class EventStatus(str, Enum):
@@ -105,8 +97,9 @@ class VTNProgram:
 class VENClient:
     """Individual VEN client that manages a single VEN instance"""
 
-    def __init__(self, config: VENConfig, vtn_base_url: str = "http://localhost:8000"):
+    def __init__(self, config: VENConfig, vtn_base_url: str = "http://localhost:8000", bearer_token:str=None):
         self.config = config
+        self.bearer_token=bearer_token
         self.vtn_base_url = vtn_base_url
         self.credentials: Optional[VENCredentials] = None
         self.session: Optional[aiohttp.ClientSession] = None
@@ -141,10 +134,12 @@ class VENClient:
                 "ven_name": self.config.ven_name,
                 "attributes": resource_config.attributes
             }
-
+            headers={'Authorization': 'Bearer '+self.bearer_token}
+            logger.info(f"Registering with auth {headers} ")
             async with self.session.post(
                 f"{self.vtn_base_url}/resources",
-                json=registration_data
+                json=registration_data,
+                headers=headers
             ) as response:
                 if response.status == 201:
                     data = await response.json()
@@ -170,9 +165,12 @@ class VENClient:
                 "ven_name": self.config.ven_name,
                 "client_name": self.config.client_name
             }
+            headers = {'Authorization': 'Bearer ' + self.bearer_token}
+            logger.info(f"Registering VEN with auth {headers} ")
             async with self.session.post(
                 f"{self.vtn_base_url}/vens",
-                json=registration_data
+                json=registration_data,
+                headers=headers
             ) as response:
                 if response.status == 201:
                     data = await response.json()
@@ -327,8 +325,9 @@ class VENClient:
 class VENManager:
     """Manages multiple VEN clients"""
 
-    def __init__(self, vtn_base_url: str = "http://localhost:8000"):
+    def __init__(self, vtn_base_url: str = "http://localhost:8000", bearer_token:str=None):
         self.vtn_base_url = vtn_base_url
+        self.bearer_token=bearer_token
         self.vens: Dict[str, VENClient] = {}
         self.program_id: Optional[str] = None
         self._stop_polling = threading.Event()  # Flag to signal thread termination
@@ -443,7 +442,7 @@ class VENManager:
         # Create VEN clients
         # For simpliocity, we'll create a single VEN instance here
         # In production, you might create multiple VENs
-        ven=VENClient(config, self.vtn_base_url)
+        ven=VENClient(config, self.vtn_base_url, self.bearer_token)
         await ven.__aenter__()
         self.vens[ven_id]=ven
 
@@ -696,13 +695,13 @@ async def init_scheduler(manager):
         mins=int(VEN_UPDATE_INTERVAL_MINUTES)
         schedule.every(10).seconds.do(manager.ven_report_usage)
 
-async def startup(ven_id="testven",vtn_url="http://localhost:8000", resource_map={}):
+async def startup(ven_id="testven",vtn_url="http://localhost:8000", bearer_token:str=None,resource_map:dict={}):
     """Main application entry point"""
     logger.info("EnergyDesk OpenADR 3.0.1 VEN Client")
     logger.info("====================================")
 
     # Initialize VEN manager
-    manager = VENManager(vtn_base_url=vtn_url)
+    manager = VENManager(vtn_base_url=vtn_url, bearer_token=bearer_token)
     await init_scheduler(manager)
     try:
 
@@ -710,6 +709,7 @@ async def startup(ven_id="testven",vtn_url="http://localhost:8000", resource_map
         # Step 1: Register all VENs
         print("\n1. Login as VEN and register Resource (Asset) instances...")
         await manager.register_ven_and_resources(ven_id, resource_map)
+        return
         print("\n2. Loading programs for ven:", ven_id)
         await manager.load_programs(ven_id)
         print("\n3. Starting event polling and response loop...")

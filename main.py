@@ -11,6 +11,7 @@ from energydeskapi.sdk.common_utils import get_environment_value
 from energydeskapi.sdk.logging_utils import setup_service_logging
 from venclient.client import startup
 from flex_resources import load_flexible_resources
+from venclient.utils import get_access_token
 logger = logging.getLogger(__name__)
 
 
@@ -28,7 +29,9 @@ if __name__ == '__main__':
 
     try:
         resource_map=load_flexible_resources()
-        asyncio.run(startup(ven_id, vtn_url, resource_map))
+        bearer_token=get_access_token()
+        logger.info(f"Bearer token: {bearer_token}")
+        asyncio.run(startup(ven_id, vtn_url, bearer_token, resource_map))
         while True:
             logger.info("Sleeping for 5 seconds")
             schedule.run_pending()
