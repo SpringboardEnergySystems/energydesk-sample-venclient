@@ -36,4 +36,4 @@ def get_access_token():
     response = requests.request("POST", token_endpoint, data=body, headers=headers)
     print(response.text)
     token_json = response.json()
-    return token_json["access_token_jwt"]
+    return token_json["access_token"]

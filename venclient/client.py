@@ -135,7 +135,6 @@ class VENClient:
                 "attributes": resource_config.attributes
             }
             headers={'Authorization': 'Bearer '+self.bearer_token}
-            logger.info(f"Registering with auth {headers} ")
             async with self.session.post(
                 f"{self.vtn_base_url}/resources",
                 json=registration_data,
@@ -166,7 +165,6 @@ class VENClient:
                 "client_name": self.config.client_name
             }
             headers = {'Authorization': 'Bearer ' + self.bearer_token}
-            logger.info(f"Registering VEN with auth {headers} ")
             async with self.session.post(
                 f"{self.vtn_base_url}/vens",
                 json=registration_data,
