@@ -2,6 +2,8 @@
 OpenADR 3.0.1 VEN Client Application
 Creates multiple VEN instances and manages their interactions with the VTN server
 """
+import traceback
+
 import schedule
 import asyncio
 import aiohttp
@@ -17,6 +19,9 @@ import threading
 import environ
 import os
 from .utils import get_environment_value, camel_to_snake, get_access_token
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from resource_db import ResourceDatabase
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -352,6 +357,42 @@ class VENManager:
         return configs
 
 
+    async def load_resources_from_vtn(self, ven_id) -> List:
+        try:
+            ven=self.vens[ven_id]
+            print("Loading resources for ven: {}".format(f"{self.vtn_base_url}/resources"))
+            print("Authenticating with token:",ven._get_auth_headers())
+            async with ven.session.get(
+                f"{self.vtn_base_url}/resources",
+                headers=ven._get_auth_headers()
+            ) as response:
+                logger.info("Loading programs for ven: {}".format(ven_id))
+                if response.status == 200:
+                    resource_data = await response.json()
+                    logger.info("Got resources {} ".format(resource_data))
+                    programs = []
+                    for pr_data in resource_data:
+                        logger.info("Loading resource {}".format(json.dumps(pr_data, indent=4)))
+                        continue
+                        prog = VTNProgram(
+                            id=pr_data["id"],
+                            event_name=pr_data["event_name"],
+                            program_id=pr_data["program_id"],
+                            start_date=pr_data["start_date"],
+                            end_date=pr_data["end_date"],
+                            status=pr_data["status"],
+                            modification_number=pr_data["modification_number"]
+                        )
+                        programs.append(prog)
+                    return programs
+                else:
+                    logger.error(f"Failed to poll events for {ven.config.ven_name}: {response.status}")
+                    return []
+        except Exception as e:
+            traceback.print_exc()
+            logger.error(f"Error polling reosurces: {str(e)}")
+            return []
+
 
     async def load_programs(self, ven_id) -> List[VTNProgram]:
         try:
@@ -427,8 +468,7 @@ class VENManager:
         else:
             return value
 
-    async def register_ven_and_resources(self, ven_id, ressource_map) -> bool:
-        """Register all VEN instances"""
+    async def register_load_ven(self, ven_id):
         logger.info("Starting VEN {} registration process...".format(ven_id))
 
         # Generate VEN configurations
@@ -441,8 +481,12 @@ class VENManager:
         # For simpliocity, we'll create a single VEN instance here
         # In production, you might create multiple VENs
         ven=VENClient(config, self.vtn_base_url, self.bearer_token)
+        print(self.vtn_base_url, ven.config.ven_name, self.bearer_token)
         await ven.__aenter__()
         self.vens[ven_id]=ven
+
+        """Register all VEN instances"""
+        ven=self.vens[ven_id]
 
         # Register all VENs concurrently
         registration_tasks = []
@@ -451,17 +495,32 @@ class VENManager:
 
         successful_registrations = sum(1 for result in results if result is True)
         logger.info(f"Successfully registered {successful_registrations}/{len(self.vens.values())} VENs")
-        from dataclasses import dataclass, fields
-        registration_tasks = []
-        resource_configs=[]
-        for resource in ressource_map.values():
+
+        return ven
+
+    async def register_resources(self, ven_id, ressource_map, delay_between_resources: float = 0.1) -> bool:
+
+        from dataclasses import fields
+
+        # Get the VEN instance
+        ven = self.vens.get(ven_id)
+        if not ven:
+            logger.error(f"VEN '{ven_id}' not found in registered VENs")
+            return False
+
+        successful_registrations = 0
+        total_resources = len(ressource_map)
+
+        logger.info(f"Registering {total_resources} resources sequentially for VEN '{ven_id}' (delay: {delay_between_resources}s between calls)...")
+
+        for idx, resource in enumerate(ressource_map.values(), 1):
             attributes=[]
             for field in fields(resource):
                 if field.name=="resourceID" or field.name=="resourceName" or field.name=="resourceType":
                     continue
                 else:
                     attribute_value = getattr(resource, field.name)
-                    print(f"Processing field {field.name} with value {attribute_value} and converting to snake_case")
+                    logger.debug(f"Processing field {field.name} with value {attribute_value} and converting to snake_case")
                     atrval=self.process_dict(attribute_value)
                     if type(atrval) is dict:
                         for k,v in atrval.items():
@@ -470,15 +529,30 @@ class VENManager:
                     else:
                         attr={'attribute_type':camel_to_snake(field.name),'attribute_name':camel_to_snake(field.name),'attribute_values':[str(atrval)]}
                         attributes.append(attr)
-            print(f"Registering resource {resource.resourceName} with attributes {attributes}")
+
+            # Log progress every 50 resources or for the first/last resource
+            if idx == 1 or idx == total_resources or idx % 50 == 0:
+                logger.info(f"  Progress: {idx}/{total_resources} resources ({(idx/total_resources)*100:.1f}%)")
+
+            logger.debug(f"[{idx}/{total_resources}] Registering resource: {resource.resourceName}")
             res_config=VENResource(resource_id=resource.resourceID,resource_name=resource.resourceName,resource_type=resource.resourceType, attributes=attributes)
-            resource_configs.append(res_config)
-            registration_tasks.append(ven.register_ven_resource(res_config))
-        results = await asyncio.gather(*registration_tasks, return_exceptions=True)
-        for r in resource_configs:
-            ven.resources[r.resource_id] = r
-        successful_registrations = sum(1 for result in results if result is True)
-        logger.info(f"Successfully registered {successful_registrations}/{len(self.vens)} VEN Resources")
+
+            # Register resource synchronously (one at a time)
+            try:
+                result = await ven.register_ven_resource(res_config)
+                if result:
+                    successful_registrations += 1
+                    ven.resources[res_config.resource_id] = res_config
+
+                # Add delay between registrations to avoid overwhelming the server
+                if idx < total_resources:  # Don't delay after the last one
+                    await asyncio.sleep(delay_between_resources)
+
+            except Exception as e:
+                logger.error(f"Error registering resource {resource.resourceName}: {str(e)}")
+                continue
+
+        logger.info(f"Successfully registered {successful_registrations}/{total_resources} VEN Resources for VEN '{ven_id}'")
 
         return successful_registrations > 0
 
@@ -693,6 +767,169 @@ async def init_scheduler(manager):
         mins=int(VEN_UPDATE_INTERVAL_MINUTES)
         schedule.every(10).seconds.do(manager.ven_report_usage)
 
+from flex_resources import Resource
+
+def load_vens_from_sqlite(db_path: str = "./config/resources.db") -> List[str]:
+    """
+    Load unique VEN identifiers from SQLite database.
+
+    Args:
+        db_path: Path to the SQLite database
+
+    Returns:
+        List of unique VEN identifiers (cities)
+    """
+    try:
+        db = ResourceDatabase(db_path=db_path)
+        stats = db.get_statistics()
+
+        # Get all unique VEN names
+        vens = list(stats['top_10_vens'].keys()) if stats['top_10_vens'] else []
+
+        # If you want ALL VENs (not just top 10), query directly
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT ven FROM resources WHERE ven IS NOT NULL ORDER BY ven")
+            all_vens = [row[0] for row in cursor.fetchall()]
+
+        logger.info(f"Loaded {len(all_vens)} VENs from SQLite database")
+        return all_vens
+
+    except Exception as e:
+        logger.error(f"Error loading VENs from SQLite: {str(e)}")
+        return []
+
+
+def load_ven_resources_from_sqlite(ven_id: str, db_path: str = "./config/resources.db") -> List[Resource]:
+    """
+    Load all resources for a specific VEN from SQLite database.
+
+    Args:
+        ven_id: The VEN identifier (city name)
+        db_path: Path to the SQLite database
+
+    Returns:
+        List of Resource objects for the specified VEN
+    """
+    try:
+        db = ResourceDatabase(db_path=db_path)
+        resources = db.get_resources_by_ven(ven_id)
+
+        logger.info(f"Loaded {len(resources)} resources for VEN '{ven_id}' from SQLite database")
+        return resources
+
+    except Exception as e:
+        logger.error(f"Error loading resources for VEN '{ven_id}' from SQLite: {str(e)}")
+        return []
+
+
+async def sample_registration(vtn_url="http://localhost:8000", bearer_token:str=None, db_path: str = "./config/resources.db", limit_vens: int = None, delay_between_resources: float = 0.1):
+    """
+    Register VENs and their resources from SQLite database with VTN server.
+
+    Args:
+        vtn_url: Base URL of the VTN server
+        bearer_token: Authentication token for VTN API
+        db_path: Path to the SQLite database containing resources
+        limit_vens: Optional limit on number of VENs to register (for testing)
+        delay_between_resources: Delay in seconds between resource registrations (default: 0.1)
+    """
+    logger.info("EnergyDesk OpenADR 3.0.1 VEN Client - Sample Registration")
+    logger.info("="*60)
+    logger.info(f"VTN URL: {vtn_url}")
+    logger.info(f"Database: {db_path}")
+
+    # Initialize VEN manager
+    manager = VENManager(vtn_base_url=vtn_url, bearer_token=bearer_token)
+
+    # Load all VENs from SQLite database
+    logger.info("\nStep 1: Loading VENs from SQLite database...")
+    vens = load_vens_from_sqlite(db_path)
+
+    if not vens:
+        logger.error("No VENs found in database. Please run prepare_samples.py first.")
+        return
+
+    logger.info(f"Found {len(vens)} VENs in database")
+
+    # Limit VENs if requested (useful for testing)
+    if limit_vens and limit_vens > 0:
+        vens = vens[:limit_vens]
+        logger.info(f"Limited to first {len(vens)} VENs for testing")
+
+    # Track statistics
+    total_vens_registered = 0
+    total_resources_registered = 0
+    failed_vens = []
+
+    try:
+        # Register each VEN and its resources
+        logger.info(f"\nStep 2: Registering {len(vens)} VENs and their resources...")
+        logger.info("-"*60)
+
+        for idx, ven_id in enumerate(vens, 1):
+            try:
+                logger.info(f"\n[{idx}/{len(vens)}] Processing VEN: {ven_id}")
+
+                # Load resources for this VEN
+                resources_of_ven = load_ven_resources_from_sqlite(ven_id, db_path)
+
+                if not resources_of_ven:
+                    logger.warning(f"  No resources found for VEN '{ven_id}', skipping...")
+                    continue
+
+                logger.info(f"  Found {len(resources_of_ven)} resources for VEN '{ven_id}'")
+
+                # Register the VEN
+                logger.info(f"  Registering VEN '{ven_id}'...")
+                await manager.register_load_ven(ven_id)
+                total_vens_registered += 1
+
+                # Convert resources to dictionary
+                resource_map: Dict[str, Resource] = {}
+                for resource in resources_of_ven:
+                    resource_map[resource.resourceID] = resource
+
+                # Register resources for this VEN
+                logger.info(f"  Registering {len(resource_map)} resources for VEN '{ven_id}'...")
+                success = await manager.register_resources(ven_id, resource_map, delay_between_resources)
+
+                if success:
+                    total_resources_registered += len(resource_map)
+                    logger.info(f"  ✓ Successfully registered VEN '{ven_id}' with {len(resource_map)} resources")
+                else:
+                    logger.warning(f"  ⚠ VEN '{ven_id}' registered but some resources may have failed")
+
+            except Exception as e:
+                logger.error(f"  ✗ Error processing VEN '{ven_id}': {str(e)}")
+                failed_vens.append((ven_id, str(e)))
+                continue
+
+        # Print summary
+        logger.info("\n" + "="*60)
+        logger.info("REGISTRATION SUMMARY")
+        logger.info("="*60)
+        logger.info(f"Total VENs processed:          {len(vens)}")
+        logger.info(f"VENs successfully registered:  {total_vens_registered}")
+        logger.info(f"Resources registered:          {total_resources_registered}")
+        logger.info(f"Failed VENs:                   {len(failed_vens)}")
+
+        if failed_vens:
+            logger.info("\nFailed VENs:")
+            for ven_id, error in failed_vens:
+                logger.info(f"  - {ven_id}: {error}")
+
+        logger.info("="*60 + "\n")
+
+    except Exception as e:
+        logger.error(f"Application error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # Cleanup
+        await manager.cleanup()
+        logger.info("Registration process completed.\n")
+
 async def startup(ven_id="testven",vtn_url="http://localhost:8000", bearer_token:str=None,resource_map:dict={}):
     """Main application entry point"""
     logger.info("EnergyDesk OpenADR 3.0.1 VEN Client")
@@ -706,7 +943,11 @@ async def startup(ven_id="testven",vtn_url="http://localhost:8000", bearer_token
 
         # Step 1: Register all VENs
         print("\n1. Login as VEN and register Resource (Asset) instances...")
-        await manager.register_ven_and_resources(ven_id, resource_map)
+        #await manager.register_resources(ven_id, resource_map)
+        print("Loading resources from config file")
+        await manager.register_load_ven(ven_id)
+        print("Loading resources from VTN")
+        #await manager.load_resources_from_vtn(ven_id)
         return
         print("\n2. Loading programs for ven:", ven_id)
         await manager.load_programs(ven_id)

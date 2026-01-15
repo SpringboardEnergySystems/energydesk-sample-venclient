@@ -16,6 +16,8 @@ class ActorType(Enum):
 class ResourceType(Enum):
     DSR = "Demand Response"
     BATTERY = "Battery"
+    PV = "Photovoltaic"
+    EV = "Electric Vehicle" # Given separate resource type from DSR since often has its own reporting
 
 @dataclass
 class Connection:
@@ -33,10 +35,12 @@ class Resource:
     resourceID: str
     resourceName: str
     resourceType: str
+    resourceSubType: str # Type within DSR,BATTERY, PV, EV
     meterPointId: str
     connection: Connection# Link to Connection, used locally to manage asset
     capacities: Dict[str, Any]
     location: Dict[str, Any]
+    address: Optional[str] = None
     enabled: Optional[bool] = None
     reporting: Optional[Dict[str, Any]] = None
 
