@@ -77,11 +77,23 @@ class ResourceDatabase:
                     ven TEXT,
                     enabled BOOLEAN DEFAULT 1,
                     reporting TEXT,
+                    registration_status TEXT DEFAULT 'PENDING',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (connection_id) REFERENCES connections(id)
                 )
             """)
+
+            # Add registration_status column if it doesn't exist (for existing databases)
+            try:
+                cursor.execute("""
+                    ALTER TABLE resources 
+                    ADD COLUMN registration_status TEXT DEFAULT 'PENDING'
+                """)
+                logger.info("Added registration_status column to existing database")
+            except sqlite3.OperationalError:
+                # Column already exists
+                pass
 
             # Create indexes for better query performance
             cursor.execute("""
@@ -269,6 +281,57 @@ class ResourceDatabase:
 
             return [self._row_to_resource(row) for row in cursor.fetchall()]
 
+    def get_resources_by_ven_and_status(self, ven: str, status: str) -> List[Resource]:
+        """
+        Retrieve resources for a specific VEN filtered by registration status.
+
+        Args:
+            ven: The VEN identifier (city/location)
+            status: Registration status ('PENDING', 'APPROVED', 'SUSPENDED')
+
+        Returns:
+            List of Resource objects
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT r.*, c.*
+                FROM resources r
+                JOIN connections c ON r.connection_id = c.id
+                WHERE r.ven = ? AND r.registration_status = ?
+            """, (ven, status))
+
+            return [self._row_to_resource(row) for row in cursor.fetchall()]
+
+    def update_resource_status(self, resource_id: str, status: str):
+        """
+        Update the registration status of a resource.
+
+        Args:
+            resource_id: The resource ID to update
+            status: New registration status ('PENDING', 'APPROVED', 'SUSPENDED')
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE resources 
+                SET registration_status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE resource_id = ?
+            """, (status, resource_id))
+            logger.info(f"Updated resource {resource_id} status to {status}")
+
+    def get_ven_list(self) -> List[str]:
+        """
+        Get list of all unique VEN identifiers.
+
+        Returns:
+            List of VEN identifiers
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT ven FROM resources WHERE ven IS NOT NULL ORDER BY ven")
+            return [row[0] for row in cursor.fetchall()]
+
     def get_all_resources(self) -> List[Resource]:
         """
         Retrieve all resources.
@@ -356,6 +419,9 @@ class ResourceDatabase:
         )
 
         # Create Resource object from row
+        # Convert row to dict to safely check for registration_status field
+        row_dict = dict(row)
+
         resource = Resource(
             resourceID=row['resource_id'],
             resourceName=row['resource_name'],
@@ -367,7 +433,8 @@ class ResourceDatabase:
             location=json.loads(row['location']),
             address=row['address'],
             enabled=bool(row['enabled']),
-            reporting=json.loads(row['reporting']) if row['reporting'] else None
+            reporting=json.loads(row['reporting']) if row['reporting'] else None,
+            registration_status=row_dict.get('registration_status', 'PENDING')
         )
 
         return resource

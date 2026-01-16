@@ -111,6 +111,7 @@ class VENClient:
         self.active_events: Dict[str, EventData] = {}
         self.reports: List[Dict] = []
         self.resources: Dict[str, VENResource] = {}
+        logger.info(f"Initializing VEN client for {self.config.ven_name} with VTN at {self.vtn_base_url} and bearer token: {self.bearer_token}")
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -169,6 +170,7 @@ class VENClient:
                 "ven_name": self.config.ven_name,
                 "client_name": self.config.client_name
             }
+            print(registration_data, self.bearer_token)
             headers = {'Authorization': 'Bearer ' + self.bearer_token}
             async with self.session.post(
                 f"{self.vtn_base_url}/vens",
@@ -292,6 +294,75 @@ class VENClient:
 
         except Exception as e:
             logger.error(f"Error creating report for {self.config.ven_name}: {str(e)}")
+            return False
+
+    async def report_meter_data(self, resource_id: str, resource_name: str, timestamp: int,
+                               power_w: float, load_id: str = None, program_id: str = None) -> bool:
+        """
+        Report meter data for a specific resource to the VTN server.
+
+        Args:
+            resource_id: Unique identifier for the resource
+            resource_name: Human-readable name of the resource
+            timestamp: Unix timestamp in milliseconds
+            power_w: Power reading in watts
+            load_id: Optional load component identifier (e.g., 'load_0')
+            program_id: Optional program identifier (not required for general meter readings)
+
+        Returns:
+            True if report was successfully sent, False otherwise
+        """
+        try:
+            # Convert timestamp from milliseconds to ISO format
+            timestamp_dt = datetime.fromtimestamp(timestamp / 1000)
+            timestamp_iso = timestamp_dt.isoformat()
+
+            # Build report data according to OpenADR 3.0 specification
+            report_data = {
+                "report_name": f"{resource_name}_{timestamp}",
+                "resource_id": resource_id,
+                "client_name": self.config.client_name,
+                "report_type": "READING",
+                "reading_type": "DIRECT_READ",
+                "start": timestamp_iso,
+                "duration": "PT0S",  # Instantaneous reading
+                "intervals": [{
+                    "id": 0,
+                    "payloads": [{
+                        "type": "USAGE",
+                        "values": [power_w / 1000]  # Convert watts to kilowatts
+                    }]
+                }],
+                "resources": [{
+                    "resource_name": resource_name
+                }]
+            }
+
+            # Add program_id only if provided
+            if program_id:
+                report_data["program_id"] = program_id
+
+            # Add load component information if provided
+            if load_id:
+                report_data["load_component"] = load_id
+
+            headers = {'Authorization': f'Bearer {self.bearer_token}', 'Content-Type': 'application/json'}
+
+            async with self.session.post(
+                f"{self.vtn_base_url}/reports",
+                json=report_data,
+                headers=headers
+            ) as response:
+                if response.status in [200, 201]:
+                    logger.debug(f"Successfully reported meter data for {resource_name} ({load_id or 'aggregate'}): {power_w:.2f}W")
+                    return True
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Failed to report meter data for {resource_name}: {response.status} - {error_text}")
+                    return False
+
+        except Exception as e:
+            logger.error(f"Error reporting meter data for {resource_name}: {str(e)}")
             return False
 
     def get_smart_response(self, event: EventData) -> ResponseType:
@@ -481,7 +552,7 @@ class VENManager:
         # For simpliocity, we'll create a single VEN instance here
         # In production, you might create multiple VENs
         ven=VENClient(config, self.vtn_base_url, self.bearer_token)
-        print(self.vtn_base_url, ven.config.ven_name, self.bearer_token)
+        #print(self.vtn_base_url, ven.config.ven_name, self.bearer_token)
         await ven.__aenter__()
         self.vens[ven_id]=ven
 
@@ -633,27 +704,69 @@ class VENManager:
         logger.info("Event polling loop terminated gracefully")
 
     async def generate_reports(self):
-        """Generate telemetry reports for all VENs"""
-        if not self.program_id:
-            logger.warning("No program available for reporting")
-            return
+        """Generate telemetry reports for all VENs using simulated meter data"""
+        logger.info("Generating telemetry reports from simulated meter data...")
 
-        logger.info("Generating telemetry reports...")
+        from venclient.simulation.meterdata_simulator import MeterDataSimulator
 
-        report_tasks = []
-        report_types = [ReportType.USAGE, ReportType.DEMAND]
-        resource_types = [ResourceType.ENERGY, ResourceType.POWER]
+        # Initialize simulator and advance time
+        ms = MeterDataSimulator()
+        ms.increase_time()
+        logger.info("Increased timestamp")
+
+        total_reports_sent = 0
+        total_resources_processed = 0
 
         for ven in self.vens.values():
-            if ven.credentials:
-                report_type = random.choice(report_types)
-                resource_type = random.choice(resource_types)
-                report_tasks.append(ven.create_report(self.program_id, report_type, resource_type))
+            #if not ven.credentials:
+            #    logger.info(f"Skipping VEN {ven.config.ven_name} - not registered")
+            #    continue
 
-        if report_tasks:
-            results = await asyncio.gather(*report_tasks, return_exceptions=True)
-            successful_reports = sum(1 for result in results if result is True)
-            logger.info(f"Successfully created {successful_reports}/{len(report_tasks)} reports")
+            # Ensure VEN has a valid session in current event loop
+            if ven.session is None or ven.session.closed:
+                logger.debug(f"Creating new session for VEN {ven.config.ven_name}")
+                ven.session = aiohttp.ClientSession()
+
+            logger.info(f"Collecting meter data for VEN: {ven.config.ven_name}")
+
+            # Collect meter data for this VEN's resources
+            resources_meterdata = ms.collect_next_metering(ven.config.ven_name)
+
+
+            if not resources_meterdata:
+                logger.info(f"No meter data available for VEN {ven.config.ven_name}")
+                continue
+
+            logger.info(f"Processing {len(resources_meterdata)} resources for VEN {ven.config.ven_name}")
+            total_resources_processed += len(resources_meterdata)
+
+            # Report data for each resource
+            report_tasks = []
+            for resource_id, meter_data in resources_meterdata.items():
+                # Get resource info if available
+                resource_info = ven.resources.get(resource_id)
+                resource_name = resource_info.resource_name if resource_info else resource_id[:16]
+
+                # Report each load component's reading
+                for reading in meter_data.readings:
+                    task = ven.report_meter_data(
+                        resource_id=resource_id,
+                        resource_name=resource_name,
+                        timestamp=reading.timestamp,
+                        power_w=reading.power_w,
+                        load_id=reading.load_id,
+                        program_id=self.program_id if self.program_id else None
+                    )
+                    report_tasks.append(task)
+
+            # Send all reports for this VEN
+            if report_tasks:
+                results = await asyncio.gather(*report_tasks, return_exceptions=True)
+                successful = sum(1 for r in results if r is True)
+                total_reports_sent += successful
+                logger.info(f"Sent {successful}/{len(report_tasks)} reports for VEN {ven.config.ven_name}")
+
+        logger.info(f"Report generation complete: {total_reports_sent} reports sent for {total_resources_processed} resources across {len(self.vens)} VENs")
 
     async def cleanup(self):
         """Clean up all VEN sessions"""
@@ -726,46 +839,45 @@ class VENManager:
         return self.poll_thread is not None and self.poll_thread.is_alive() and not self._stop_polling.is_set()
 
 
-    def ven_report_usage(self) -> bool:
+    async def ven_report_usage(self):
         """
-        Placeholder for the VEN update logic.
-        This method should be implemented to perform the actual update.
+        Report usage data for all VENs using simulated meter data.
+        This method is called by the scheduler to periodically report meter data to the VTN.
         """
-        report_tasks = []
-        report_types = [ReportType.USAGE]
-        resource_types = [ResourceType.POWER]
-        report_type=report_types[0]
-        resource_type=resource_types[0]
-        logger.info("Generating reports for all VENs...")
-        fields=['power', 'energy', 'state_of_charge', 'voltage', 'frequency']
-        for ven in self.vens.values():
-            logger.info("Reporting usage for VEN: {}".format(ven.config.ven_name))
-            for resource in ven.resources.values():
-                # Here you would typically fetch the latest data and generate a report
-                # For demonstration, we will just print the resource details
-                logger.info(f"Resource ID: {resource.resource_id}, Name: {resource.resource_name}, Type: {resource.resource_type}")
-                records = []#read_influxdb("mybucket", "sensordata", fields=fields, tags={'resource_id': resource.resource_id}, start_time="-100y")
-                for r in records:
-                    logger.debug("Sensor data to report {}".format(r))
-                report_tasks.append(ven.create_report(self.program_id, report_type, resource_type))
+        try:
+            logger.info("Scheduled report generation triggered...")
+            await self.generate_reports()
+        except Exception as e:
+            logger.error(f"Error in ven_report_usage: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
 
+def init_scheduler(manager):
+    """
+    Initialize the scheduler for periodic meter data reporting.
+    Since schedule library doesn't support async functions, we wrap the async call.
+    """
+    def run_report_job():
+        """Synchronous wrapper for async report generation"""
+        try:
+            logger.info("Scheduled report generation triggered...")
+            # Run the async function in the existing event loop
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If loop is already running, create a task
+                asyncio.create_task(manager.ven_report_usage())
+            else:
+                # Otherwise run it directly
+                loop.run_until_complete(manager.ven_report_usage())
+        except Exception as e:
+            logger.error(f"Error in scheduled report job: {str(e)}")
+            import traceback
+            traceback.print_exc()
 
-        #records=read_influxdb("mybucket","sensordata", {'resource_id': 'shop-001'}, start_time="-100y")
+    schedule.every(3).seconds.do(run_report_job)
+    logger.info("Scheduler initialized: reports will be generated every 10 seconds")
 
-        #asyncio.run(self.generate_reports())
-        # Implement the actual VEN update logic here
-        # For example, fetching data from a VTN server and updating local state
-        # This is just a placeholder for demonstration purposes
-        pass
-
-
-async def init_scheduler(manager):
-    VEN_UPDATE_INTERVAL_MINUTES = get_environment_value('VEN_UPDATE_INTERVAL_MINUTES', None)
-    print("Initializing schedule", VEN_UPDATE_INTERVAL_MINUTES)
-    if VEN_UPDATE_INTERVAL_MINUTES is not None:
-        mins=int(VEN_UPDATE_INTERVAL_MINUTES)
-        schedule.every(10).seconds.do(manager.ven_report_usage)
 
 from flex_resources import Resource
 
@@ -930,33 +1042,31 @@ async def sample_registration(vtn_url="http://localhost:8000", bearer_token:str=
         await manager.cleanup()
         logger.info("Registration process completed.\n")
 
-async def startup(ven_id="testven",vtn_url="http://localhost:8000", bearer_token:str=None,resource_map:dict={}):
+
+from venclient.simulation.meterdata_simulator import MeterDataSimulator
+async def startup(vtn_url="http://localhost:8000", bearer_token:str=None,db_path: str = "./config/resources.db"):
     """Main application entry point"""
     logger.info("EnergyDesk OpenADR 3.0.1 VEN Client")
     logger.info("====================================")
 
     # Initialize VEN manager
     manager = VENManager(vtn_base_url=vtn_url, bearer_token=bearer_token)
-    await init_scheduler(manager)
+
+    # Load all VENs from SQLite database
+    logger.info("\nStep 1: Loading VENs from SQLite database...")
+    vens = load_vens_from_sqlite(db_path)
+    for ven_id in vens[:10]:
+        await manager.register_load_ven(ven_id)
+    ms=MeterDataSimulator()
+    ms.initialize_resources(vens)
+    #init_scheduler(manager)
     try:
 
 
-        # Step 1: Register all VENs
-        print("\n1. Login as VEN and register Resource (Asset) instances...")
-        #await manager.register_resources(ven_id, resource_map)
-        print("Loading resources from config file")
-        await manager.register_load_ven(ven_id)
-        print("Loading resources from VTN")
-        #await manager.load_resources_from_vtn(ven_id)
-        return
-        print("\n2. Loading programs for ven:", ven_id)
-        await manager.load_programs(ven_id)
-        print("\n3. Starting event polling and response loop...")
+        #manager.run_async_polling()  # Start polling VTN in a separate thread
 
-        manager.run_async_polling()  # Start polling VTN in a separate thread
-
-        while manager.poll_thread.is_alive():
-            schedule.run_pending()  # This scheduler checks status on Resources and generates reports to VTN
+        while True:
+            #schedule.run_pending()  # This scheduler checks status on Resources and generates reports to VTN
             time.sleep(1)
         # Step 6: Generate final reports
         #   print("\n6. Generating final reports...")

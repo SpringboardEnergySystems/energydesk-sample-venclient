@@ -43,6 +43,7 @@ class Resource:
     address: Optional[str] = None
     enabled: Optional[bool] = None
     reporting: Optional[Dict[str, Any]] = None
+    registration_status: Optional[str] = 'PENDING'  # PENDING, APPROVED, SUSPENDED
 
 
 def load_flexible_resources(
