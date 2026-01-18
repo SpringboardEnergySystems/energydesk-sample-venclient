@@ -909,15 +909,7 @@ class VENManager:
                         'attribute_values': [str(v)]
                     })
 
-            # NOTE: longitude and latitude are now in service_location, not attributes
-
-            # Add address
-            if address:
-                attributes.append({
-                    'attribute_type': 'address',
-                    'attribute_name': 'address',
-                    'attribute_values': [address]
-                })
+            # NOTE: longitude, latitude, and address are now in service_location, not attributes
 
             # Add load-specific attributes
             attributes.append({
@@ -949,7 +941,7 @@ class VENManager:
                 attributes=attributes
             )
 
-            # Build service_location with meterpoint_id, longitude, and latitude
+            # Build service_location with meterpoint_id, longitude, latitude, and address
             service_location_dict = {
                 "meterpoint_id": meter_point_id  # Note: all lowercase, no underscore
             }
@@ -957,6 +949,8 @@ class VENManager:
                 service_location_dict["longitude"] = float(longitude)
             if latitude is not None:
                 service_location_dict["latitude"] = float(latitude)
+            if address:
+                service_location_dict["address"] = address
 
             registration_data.append({
                 'config': res_config,

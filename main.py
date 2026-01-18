@@ -92,8 +92,8 @@ async def initialize_ven_system(vtn_url: str, bearer_token: str, db_path: str = 
         logger.info(f"  [{idx}/{len(vens_to_register)}] Registering VEN: {ven_id}")
         try:
             await manager.register_load_ven(ven_id)
-            #await manager.register_resources(ven_id)
-            await manager.bulk_upload_historical_meterdata(ven_id)
+            await manager.register_resources(ven_id)
+            #await manager.bulk_upload_historical_meterdata(ven_id)
         except Exception as e:
             logger.error(f"  Failed to register VEN {ven_id}: {e}")
 
