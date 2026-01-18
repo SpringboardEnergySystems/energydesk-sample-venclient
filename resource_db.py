@@ -116,6 +116,50 @@ class ResourceDatabase:
                 ON resources(ven)
             """)
 
+            # Add h5_meter_id column to resources table if it doesn't exist
+            try:
+                cursor.execute("""
+                    ALTER TABLE resources 
+                    ADD COLUMN h5_meter_id TEXT
+                """)
+                logger.info("Added h5_meter_id column to resources table")
+            except sqlite3.OperationalError:
+                # Column already exists
+                pass
+
+            # Loads table - stores individual load components for each resource
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS loads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    load_id TEXT UNIQUE NOT NULL,
+                    resource_id TEXT NOT NULL,
+                    load_component TEXT NOT NULL,
+                    load_name TEXT,
+                    h5_meter_id TEXT NOT NULL,
+                    vtn_resource_id TEXT,
+                    registration_status TEXT DEFAULT 'PENDING',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (resource_id) REFERENCES resources(resource_id)
+                )
+            """)
+
+            # Create indexes for loads table
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_load_resource_id 
+                ON loads(resource_id)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_load_h5_meter_id 
+                ON loads(h5_meter_id)
+            """)
+
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_load_vtn_resource_id 
+                ON loads(vtn_resource_id)
+            """)
+
             logger.info(f"Database initialized at {self.db_path}")
 
     def insert_connection(self, connection: Connection) -> int:
@@ -446,4 +490,155 @@ class ResourceDatabase:
             cursor.execute("DELETE FROM resources")
             cursor.execute("DELETE FROM connections")
             logger.warning("All resources and connections deleted from database")
+
+    def update_resource_h5_meter(self, resource_id: str, h5_meter_id: str):
+        """
+        Update the h5_meter_id for a resource.
+
+        Args:
+            resource_id: The resource ID to update
+            h5_meter_id: The h5 meter ID to assign
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE resources 
+                SET h5_meter_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE resource_id = ?
+            """, (h5_meter_id, resource_id))
+            logger.debug(f"Assigned h5_meter_id {h5_meter_id} to resource {resource_id}")
+
+    def insert_load(self, load_id: str, resource_id: str, load_component: str,
+                   load_name: str, h5_meter_id: str, vtn_resource_id: str = None):
+        """
+        Insert a load component.
+
+        Args:
+            load_id: Unique load identifier
+            resource_id: The resource ID this load belongs to
+            load_component: Load component name (e.g., 'load_0', 'load_1')
+            load_name: Human-readable load name
+            h5_meter_id: The h5 meter ID containing the load data
+            vtn_resource_id: VTN resource ID (if registered)
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO loads 
+                (load_id, resource_id, load_component, load_name, h5_meter_id, vtn_resource_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (load_id, resource_id, load_component, load_name, h5_meter_id, vtn_resource_id))
+            logger.debug(f"Inserted load: {load_id} for resource {resource_id}")
+
+    def bulk_insert_loads(self, loads: List[tuple]):
+        """
+        Bulk insert loads for better performance.
+
+        Args:
+            loads: List of tuples containing (load_id, resource_id, load_component,
+                   load_name, h5_meter_id, vtn_resource_id)
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.executemany("""
+                INSERT OR REPLACE INTO loads 
+                (load_id, resource_id, load_component, load_name, h5_meter_id, vtn_resource_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, loads)
+            logger.info(f"Bulk inserted {len(loads)} loads")
+
+    def get_loads_by_resource(self, resource_id: str) -> List[Dict]:
+        """
+        Get all loads for a specific resource.
+
+        Args:
+            resource_id: The resource ID
+
+        Returns:
+            List of load dictionaries
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM loads WHERE resource_id = ?
+            """, (resource_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_loads_by_h5_meter(self, h5_meter_id: str) -> List[Dict]:
+        """
+        Get all loads using a specific h5 meter.
+
+        Args:
+            h5_meter_id: The h5 meter ID
+
+        Returns:
+            List of load dictionaries
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT * FROM loads WHERE h5_meter_id = ?
+            """, (h5_meter_id,))
+            return [dict(row) for row in cursor.fetchall()]
+
+    def update_load_vtn_resource_id(self, load_id: str, vtn_resource_id: str, status: str = 'APPROVED'):
+        """
+        Update the VTN resource ID for a load after registration.
+
+        Args:
+            load_id: The load ID to update
+            vtn_resource_id: The VTN-assigned resource ID
+            status: Registration status
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE loads 
+                SET vtn_resource_id = ?, registration_status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE load_id = ?
+            """, (vtn_resource_id, status, load_id))
+            logger.info(f"Updated load {load_id} with VTN resource ID {vtn_resource_id}")
+
+    def clear_all_loads(self):
+        """Delete all loads. Use with caution!"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM loads")
+            logger.warning("All loads deleted from database")
+
+    def get_load_statistics(self) -> Dict:
+        """
+        Get load statistics.
+
+        Returns:
+            Dictionary with statistics
+        """
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Total loads
+            cursor.execute("SELECT COUNT(*) FROM loads")
+            total_loads = cursor.fetchone()[0]
+
+            # Loads by component
+            cursor.execute("""
+                SELECT load_component, COUNT(*) as count
+                FROM loads
+                GROUP BY load_component
+            """)
+            by_component = {row[0]: row[1] for row in cursor.fetchall()}
+
+            # Loads by status
+            cursor.execute("""
+                SELECT registration_status, COUNT(*) as count
+                FROM loads
+                GROUP BY registration_status
+            """)
+            by_status = {row[0]: row[1] for row in cursor.fetchall()}
+
+            return {
+                'total_loads': total_loads,
+                'by_component': by_component,
+                'by_status': by_status
+            }
 

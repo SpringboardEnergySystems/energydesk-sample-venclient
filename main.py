@@ -87,11 +87,13 @@ async def initialize_ven_system(vtn_url: str, bearer_token: str, db_path: str = 
 
     # Step 3: Register VENs with VTN (limit for testing)
     logger.info("Step 3: Registering VENs with VTN server...")
-    vens_to_register = vens[:10]  # Limit to first 10 for testing
+    vens_to_register = vens # Limit to first 10 for testing
     for idx, ven_id in enumerate(vens_to_register, 1):
         logger.info(f"  [{idx}/{len(vens_to_register)}] Registering VEN: {ven_id}")
         try:
             await manager.register_load_ven(ven_id)
+            #await manager.register_resources(ven_id)
+            await manager.bulk_upload_historical_meterdata(ven_id)
         except Exception as e:
             logger.error(f"  Failed to register VEN {ven_id}: {e}")
 
@@ -150,7 +152,7 @@ if __name__ == '__main__':
         # Configure and start scheduler
         logger.info("Starting task scheduler...")
         scheduler = start_scheduler()
-        scheduler.start()
+        #scheduler.start()
         logger.info("Scheduler started successfully")
 
         # Main loop - keep application running

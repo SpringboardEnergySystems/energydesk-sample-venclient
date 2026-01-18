@@ -37,17 +37,18 @@ async def report_meter_data(
 ```json
 {
   "report_name": "Murphy's Pub_1737036000000",
+  "ven_id": "ven-uuid-12345",
   "resource_id": "5249eada-69af-432d-99a5-98f9c89f9aa6",
   "client_name": "Client_Herning",
-  "report_type": "READING",
-  "reading_type": "DIRECT_READ",
+  "report_type": "usage",
+  "reading_type": "power",
   "start": "2026-01-16T10:00:00",
   "duration": "PT0S",
   "intervals": [{
     "id": 0,
     "payloads": [{
       "type": "USAGE",
-      "values": [1.234]  // kW
+      "values": [1.234]
     }]
   }],
   "resources": [{
@@ -57,6 +58,11 @@ async def report_meter_data(
   "program_id": "optional-program-id"
 }
 ```
+
+**Required Fields:**
+- `ven_id` - VEN identifier (obtained during registration)
+- `report_type` - Must be one of: 'usage', 'demand', 'baseline', 'deviation'
+- `reading_type` - Must be one of: 'energy', 'power', 'state_of_charge', 'voltage', 'frequency'
 
 ### 2. VENManager.generate_reports()
 

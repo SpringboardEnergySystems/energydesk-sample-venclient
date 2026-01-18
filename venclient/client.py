@@ -130,8 +130,20 @@ class VENClient:
             "Content-Type": "application/json"
         }
 
-    async def register_ven_resource(self, resource_config:VENResource) -> bool:
-        """Register this VEN with the VTN server"""
+
+    async def register_ven_resource(self, resource_config: VENResource, external_resource_id: str = None,
+                                   service_location: dict = None) -> Optional[str]:
+        """
+        Register a VEN resource with the VTN server.
+
+        Args:
+            resource_config: Resource configuration
+            external_resource_id: External resource identifier (resource_id + load_component)
+            service_location: Service location dict with meter_point_id, longitude, latitude
+
+        Returns:
+            VTN-assigned resource ID if successful, None otherwise
+        """
         try:
             registration_data = {
                 "id": resource_config.resource_id,
@@ -140,7 +152,16 @@ class VENClient:
                 "ven_name": self.config.ven_name,
                 "attributes": resource_config.attributes
             }
-            headers={'Authorization': 'Bearer '+self.bearer_token}
+
+            # Add external_resource_id if provided
+            if external_resource_id:
+                registration_data["external_resource_id"] = external_resource_id
+
+            # Add service_location if provided
+            if service_location:
+                registration_data["service_location"] = service_location
+
+            headers = {'Authorization': 'Bearer ' + self.bearer_token}
             async with self.session.post(
                 f"{self.vtn_base_url}/resources",
                 json=registration_data,
@@ -148,20 +169,37 @@ class VENClient:
             ) as response:
                 if response.status == 201:
                     data = await response.json()
-                    logger.info(f"Successfully registered VEN Resource: {json.dumps(data, indent=2)}")
-                    logger.info(f"Successfully registered VEN: {resource_config.resource_name}")
-                    return True
+                    vtn_resource_id = data.get("id")
+                    logger.info(f"Successfully registered VEN Resource: {resource_config.resource_name} -> VTN ID: {vtn_resource_id}")
+                    return vtn_resource_id
                 elif response.status == 409:
-                    logger.warning(f"VEN Resource {resource_config.resource_name} already exists")
-                    return False
+                    logger.warning(f"VEN Resource {resource_config.resource_name} already exists (409)")
+                    # Try to get existing resource ID from response
+                    try:
+                        data = await response.json()
+                        return data.get("id")
+                    except:
+                        return None
+                elif response.status == 500:
+                    # Workaround: VTN server may return 500 when finding existing resource
+                    error_text = await response.text()
+                    if "existing resource" in error_text.lower() or external_resource_id:
+                        logger.warning(f"VEN Resource {resource_config.resource_name} likely already exists (500 error - VTN bug)")
+                        # Try to fetch the resource by external_resource_id to get its VTN ID
+                        # For now, log and return None - resource exists but we can't get its ID
+                        logger.info(f"Skipping - external_resource_id: {external_resource_id}")
+                        return None  # Treat as "already registered"
+                    else:
+                        logger.error(f"Failed to register VEN Resource {resource_config.resource_name}: {error_text}")
+                        return None
                 else:
                     error_text = await response.text()
-                    logger.error(f"Failed to register VEN  Resource{resource_config.resource_name}: {error_text}")
-                    return False
+                    logger.error(f"Failed to register VEN Resource {resource_config.resource_name}: {error_text}")
+                    return None
 
         except Exception as e:
             logger.error(f"Error registering Resource {resource_config.resource_name}: {str(e)}")
-            return False
+            return None
 
     async def register_ven(self) -> bool:
         """Register this VEN with the VTN server"""
@@ -317,13 +355,14 @@ class VENClient:
             timestamp_dt = datetime.fromtimestamp(timestamp / 1000)
             timestamp_iso = timestamp_dt.isoformat()
 
-            # Build report data according to OpenADR 3.0 specification
+            # Build report data according to VTN server's expected format
             report_data = {
                 "report_name": f"{resource_name}_{timestamp}",
+                "ven_id": self.credentials.ven_id if self.credentials else "unknown",  # Required field
                 "resource_id": resource_id,
                 "client_name": self.config.client_name,
-                "report_type": "READING",
-                "reading_type": "DIRECT_READ",
+                "report_type": "usage",  # Must be: 'usage', 'demand', 'baseline' or 'deviation'
+                "reading_type": "power",  # Must be: 'energy', 'power', 'state_of_charge', 'voltage' or 'frequency'
                 "start": timestamp_iso,
                 "duration": "PT0S",  # Instantaneous reading
                 "intervals": [{
@@ -362,7 +401,14 @@ class VENClient:
                     return False
 
         except Exception as e:
-            logger.error(f"Error reporting meter data for {resource_name}: {str(e)}")
+            error_msg = str(e)
+            # Add more context for event loop errors
+            if "Event loop is closed" in error_msg or "attached to a different loop" in error_msg:
+                logger.error(f"Event loop error reporting meter data for {resource_name}: {error_msg}")
+                logger.debug(f"  Session state: closed={getattr(self.session, 'closed', 'unknown')}")
+                logger.debug(f"  Try recreating the session in generate_reports()")
+            else:
+                logger.error(f"Error reporting meter data for {resource_name}: {error_msg}")
             return False
 
     def get_smart_response(self, event: EventData) -> ResponseType:
@@ -569,63 +615,418 @@ class VENManager:
 
         return ven
 
-    async def register_resources(self, ven_id, ressource_map, delay_between_resources: float = 0.1) -> bool:
+    async def bulk_upload_historical_meterdata(self, ven_id: str,
+                                              db_path: str = "./config/resources.db",
+                                              h5_file_path: str = "./config/examplemeterdata/load_data.h5",
+                                              chunk_size: int = 50000,
+                                              batch_size: int = 5000,
+                                              limit_loads: int = None) -> Dict[str, any]:
+        """
+        Upload historical meter data from H5 files to VTN in bulk.
 
+        Args:
+            ven_id: VEN identifier (city name)
+            db_path: Path to SQLite database
+            h5_file_path: Path to H5 file with meter data
+            chunk_size: Number of points to upload per chunk (default: 50000)
+            batch_size: InfluxDB batch size for writes (default: 5000)
+            limit_loads: Optional limit on number of loads to process (for testing)
+
+        Returns:
+            Dictionary with upload statistics
+        """
+        import h5py
+        import pandas as pd
+
+        logger.info(f"Starting bulk upload of historical meter data for VEN '{ven_id}'")
+
+        # Initialize database
+        db = ResourceDatabase(db_path=db_path)
+
+        # Get the VEN instance
+        ven = self.vens.get(ven_id)
+        if not ven:
+            logger.error(f"VEN '{ven_id}' not found in registered VENs")
+            return {"success": False, "error": "VEN not found"}
+
+        # Query loads with VTN resource IDs from database
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            query = """
+                SELECT 
+                    l.load_id,
+                    l.load_component,
+                    l.load_name,
+                    l.h5_meter_id,
+                    l.vtn_resource_id,
+                    r.resource_name
+                FROM loads l
+                JOIN resources r ON l.resource_id = r.resource_id
+                WHERE r.ven = ? AND l.vtn_resource_id IS NOT NULL
+                ORDER BY r.resource_id, l.load_component
+            """
+            if limit_loads:
+                query += f" LIMIT {limit_loads}"
+
+            cursor.execute(query, (ven_id,))
+            load_records = cursor.fetchall()
+
+        if not load_records:
+            logger.warning(f"No loads with VTN resource IDs found for VEN '{ven_id}'")
+            return {"success": True, "total_loads": 0, "uploaded": 0, "error": "No registered loads"}
+
+        logger.info(f"Found {len(load_records)} loads to upload for VEN '{ven_id}'")
+
+        # Track statistics
+        total_loads = len(load_records)
+        successful_uploads = 0
+        failed_uploads = 0
+        total_points_uploaded = 0
+
+        # Open H5 file
+        with h5py.File(h5_file_path, 'r') as hf:
+            meters_group = hf['meters']
+
+            # Process each load
+            for idx, record in enumerate(load_records, 1):
+                (load_id, load_component, load_name, h5_meter_id,
+                 vtn_resource_id, resource_name) = record
+
+                logger.info(f"[{idx}/{total_loads}] Uploading {resource_name} - {load_name}")
+
+                try:
+                    # Check if meter exists in H5 file
+                    if h5_meter_id not in meters_group:
+                        logger.error(f"  H5 meter '{h5_meter_id}' not found")
+                        failed_uploads += 1
+                        continue
+
+                    # Get the meter and load component
+                    meter = meters_group[h5_meter_id]
+                    if load_component not in meter:
+                        logger.error(f"  Load component '{load_component}' not found in meter")
+                        failed_uploads += 1
+                        continue
+
+                    load_group = meter[load_component]
+                    if 'power' not in load_group:
+                        logger.error(f"  'power' dataset not found")
+                        failed_uploads += 1
+                        continue
+
+                    # Load power data
+                    power_data = load_group['power'][:]
+                    df = pd.DataFrame(power_data, columns=['timestamp', 'power_w'])
+
+                    logger.info(f"  Loaded {len(df)} data points from H5 file")
+
+                    # Upload in chunks if dataset is large
+                    total_points = len(df)
+                    uploaded_points = 0
+
+                    for chunk_start in range(0, total_points, chunk_size):
+                        chunk_end = min(chunk_start + chunk_size, total_points)
+                        chunk_df = df.iloc[chunk_start:chunk_end]
+
+                        # Format data for bulk upload API
+                        data_points = []
+                        for _, row in chunk_df.iterrows():
+                            timestamp = pd.to_datetime(row['timestamp'], unit='s')
+                            interval_end = timestamp + pd.Timedelta(hours=1)  # 1-hour intervals
+
+                            data_points.append({
+                                "interval_start": timestamp.isoformat() + "Z",
+                                "interval_end": interval_end.isoformat() + "Z",
+                                "value": float(row['power_w']),
+                                "quality_code": "GOOD"
+                            })
+
+                        # Upload chunk to VTN
+                        logger.info(f"  Uploading chunk {chunk_start//chunk_size + 1}: {len(data_points)} points...")
+
+                        response = await ven.session.post(
+                            f"{self.vtn_base_url}/report_data/bulk",
+                            params={
+                                "resource_id": vtn_resource_id,
+                                "batch_size": batch_size
+                            },
+                            headers={'Authorization': 'Bearer ' + self.bearer_token},
+                            json=data_points,
+                            timeout=aiohttp.ClientTimeout(total=300)  # 5 minute timeout
+                        )
+
+                        if response.status == 201:
+                            result = await response.json()
+                            uploaded_points += result.get('entries_created', 0)
+                            throughput = result.get('throughput_points_per_second', 0)
+                            logger.info(f"  ✓ Uploaded {uploaded_points}/{total_points} points ({throughput:.0f} pts/sec)")
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"  Failed to upload chunk: {response.status} - {error_text}")
+                            break
+
+                    if uploaded_points == total_points:
+                        successful_uploads += 1
+                        total_points_uploaded += uploaded_points
+                        logger.info(f"  ✓ Complete: {uploaded_points} points uploaded")
+                    else:
+                        failed_uploads += 1
+                        logger.warning(f"  Partial upload: {uploaded_points}/{total_points} points")
+
+                except Exception as e:
+                    logger.error(f"  Error uploading load: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    failed_uploads += 1
+
+        # Return statistics
+        stats = {
+            "success": True,
+            "ven_id": ven_id,
+            "total_loads": total_loads,
+            "successful": successful_uploads,
+            "failed": failed_uploads,
+            "total_points_uploaded": total_points_uploaded
+        }
+
+        logger.info(f"Bulk upload complete for VEN '{ven_id}': {successful_uploads}/{total_loads} loads uploaded")
+        logger.info(f"Total data points uploaded: {total_points_uploaded:,}")
+
+        return stats
+
+    async def register_resources(self, ven_id) -> Dict[str, any]:
+        """
+        DEPRECATED: Use register_loads_parallel instead.
+        This method is kept for backward compatibility.
+
+        Returns:
+            Dictionary with registration statistics (for compatibility)
+        """
+        logger.warning("register_resources is deprecated. Use register_loads_parallel for better performance.")
+        stats = await self.register_loads_parallel(ven_id, batch_size=50, delay_between_batches=0.5)
+
+        # Convert to old format for backward compatibility
+        return {
+            'success': stats.get('success', False),
+            'registered': stats.get('registered', 0),
+            'total': stats.get('total_loads', 0)
+        }
+
+    async def register_loads_parallel(self, ven_id: str, batch_size: int = 50,
+                                     delay_between_batches: float = 0.5,
+                                     db_path: str = "./config/resources.db") -> Dict[str, any]:
+        """
+        Register all loads for a VEN in parallel batches with the VTN server.
+
+        Args:
+            ven_id: VEN identifier (city name)
+            batch_size: Number of resources to register in parallel per batch
+            delay_between_batches: Delay between batches to avoid overwhelming server
+            db_path: Path to SQLite database
+
+        Returns:
+            Dictionary with registration statistics
+        """
         from dataclasses import fields
 
         # Get the VEN instance
         ven = self.vens.get(ven_id)
         if not ven:
             logger.error(f"VEN '{ven_id}' not found in registered VENs")
-            return False
+            return {"success": False, "error": "VEN not found"}
 
-        successful_registrations = 0
-        total_resources = len(ressource_map)
+        logger.info(f"Registering loads for VEN '{ven_id}' in parallel batches of {batch_size}...")
 
-        logger.info(f"Registering {total_resources} resources sequentially for VEN '{ven_id}' (delay: {delay_between_resources}s between calls)...")
+        # Load resources and their loads from database
+        db = ResourceDatabase(db_path=db_path)
 
-        for idx, resource in enumerate(ressource_map.values(), 1):
-            attributes=[]
-            for field in fields(resource):
-                if field.name=="resourceID" or field.name=="resourceName" or field.name=="resourceType":
-                    continue
+        # Query to get all resources with their loads
+        with db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT 
+                    r.resource_id,
+                    r.resource_name,
+                    r.resource_type,
+                    r.resource_sub_type,
+                    r.meter_point_id,
+                    r.capacities,
+                    r.location,
+                    r.address,
+                    r.enabled,
+                    r.reporting,
+                    l.load_id,
+                    l.load_component,
+                    l.load_name,
+                    l.h5_meter_id
+                FROM resources r
+                JOIN loads l ON r.resource_id = l.resource_id
+                WHERE r.ven = ?
+                ORDER BY r.resource_id, l.load_component
+            """, (ven_id,))
+
+            resource_load_rows = cursor.fetchall()
+
+        if not resource_load_rows:
+            logger.warning(f"No resources/loads found for VEN '{ven_id}'")
+            return {"success": True, "total_loads": 0, "registered": 0, "failed": 0}
+
+        logger.info(f"Found {len(resource_load_rows)} load records for VEN '{ven_id}'")
+
+        # Prepare registration tasks
+        registration_data = []
+        for row in resource_load_rows:
+            (resource_id, resource_name, resource_type, resource_sub_type,
+             meter_point_id, capacities_json, location_json, address, enabled, reporting_json,
+             load_id, load_component, load_name, h5_meter_id) = row
+
+            # Parse JSON fields
+            capacities = json.loads(capacities_json)
+            location = json.loads(location_json)
+            reporting = json.loads(reporting_json) if reporting_json else None
+
+            # Extract longitude and latitude for service_location
+            longitude = location.get('longitude') if location else None
+            latitude = location.get('latitude') if location else None
+
+            # Build attributes from resource data (excluding longitude/latitude)
+            attributes = []
+
+            # Add resource sub type
+            if resource_sub_type:
+                attributes.append({
+                    'attribute_type': 'resource_sub_type',
+                    'attribute_name': 'resource_sub_type',
+                    'attribute_values': [resource_sub_type]
+                })
+
+            # Add capacities
+            if capacities:
+                for k, v in capacities.items():
+                    attributes.append({
+                        'attribute_type': camel_to_snake(k),
+                        'attribute_name': k,
+                        'attribute_values': [str(v)]
+                    })
+
+            # NOTE: longitude and latitude are now in service_location, not attributes
+
+            # Add address
+            if address:
+                attributes.append({
+                    'attribute_type': 'address',
+                    'attribute_name': 'address',
+                    'attribute_values': [address]
+                })
+
+            # Add load-specific attributes
+            attributes.append({
+                'attribute_type': 'load_component',
+                'attribute_name': 'load_component',
+                'attribute_values': [load_component]
+            })
+
+            attributes.append({
+                'attribute_type': 'load_name',
+                'attribute_name': 'load_name',
+                'attribute_values': [load_name]
+            })
+
+            attributes.append({
+                'attribute_type': 'h5_meter_id',
+                'attribute_name': 'h5_meter_id',
+                'attribute_values': [h5_meter_id]
+            })
+
+            # Create resource config for this load
+            load_resource_name = f"{resource_name} - {load_name}"
+            external_resource_id = f"{resource_id}_{load_component}"
+
+            res_config = VENResource(
+                resource_id=load_id,  # Use load_id as the resource ID
+                resource_name=load_resource_name,
+                resource_type=resource_type,
+                attributes=attributes
+            )
+
+            # Build service_location with meterpoint_id, longitude, and latitude
+            service_location_dict = {
+                "meterpoint_id": meter_point_id  # Note: all lowercase, no underscore
+            }
+            if longitude is not None:
+                service_location_dict["longitude"] = float(longitude)
+            if latitude is not None:
+                service_location_dict["latitude"] = float(latitude)
+
+            registration_data.append({
+                'config': res_config,
+                'external_resource_id': external_resource_id,
+                'service_location': service_location_dict,
+                'load_id': load_id
+            })
+
+        # Register in parallel batches
+        total_loads = len(registration_data)
+        registered_count = 0
+        failed_count = 0
+        vtn_resource_ids = {}  # Map load_id -> vtn_resource_id
+
+        for batch_start in range(0, total_loads, batch_size):
+            batch_end = min(batch_start + batch_size, total_loads)
+            batch = registration_data[batch_start:batch_end]
+
+            logger.info(f"Registering batch {batch_start//batch_size + 1}: loads {batch_start+1}-{batch_end}/{total_loads}")
+
+            # Create parallel tasks for this batch
+            tasks = []
+            for item in batch:
+                task = ven.register_ven_resource(
+                    item['config'],
+                    external_resource_id=item['external_resource_id'],
+                    service_location=item['service_location']
+                )
+                tasks.append(task)
+
+            # Execute batch in parallel
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Process results
+            for item, result in zip(batch, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error registering load {item['load_id']}: {result}")
+                    failed_count += 1
+                elif result:  # VTN resource ID returned
+                    vtn_resource_ids[item['load_id']] = result
+                    registered_count += 1
                 else:
-                    attribute_value = getattr(resource, field.name)
-                    logger.debug(f"Processing field {field.name} with value {attribute_value} and converting to snake_case")
-                    atrval=self.process_dict(attribute_value)
-                    if type(atrval) is dict:
-                        for k,v in atrval.items():
-                            attr={'attribute_type':camel_to_snake(k),'attribute_name':k,'attribute_values':[str(v)]}
-                            attributes.append(attr)
-                    else:
-                        attr={'attribute_type':camel_to_snake(field.name),'attribute_name':camel_to_snake(field.name),'attribute_values':[str(atrval)]}
-                        attributes.append(attr)
+                    failed_count += 1
 
-            # Log progress every 50 resources or for the first/last resource
-            if idx == 1 or idx == total_resources or idx % 50 == 0:
-                logger.info(f"  Progress: {idx}/{total_resources} resources ({(idx/total_resources)*100:.1f}%)")
+            # Delay between batches
+            if batch_end < total_loads:
+                await asyncio.sleep(delay_between_batches)
 
-            logger.debug(f"[{idx}/{total_resources}] Registering resource: {resource.resourceName}")
-            res_config=VENResource(resource_id=resource.resourceID,resource_name=resource.resourceName,resource_type=resource.resourceType, attributes=attributes)
-
-            # Register resource synchronously (one at a time)
+        # Update loads table with VTN resource IDs
+        logger.info(f"Updating {len(vtn_resource_ids)} load records with VTN resource IDs...")
+        for load_id, vtn_resource_id in vtn_resource_ids.items():
             try:
-                result = await ven.register_ven_resource(res_config)
-                if result:
-                    successful_registrations += 1
-                    ven.resources[res_config.resource_id] = res_config
-
-                # Add delay between registrations to avoid overwhelming the server
-                if idx < total_resources:  # Don't delay after the last one
-                    await asyncio.sleep(delay_between_resources)
-
+                db.update_load_vtn_resource_id(load_id, vtn_resource_id, 'APPROVED')
             except Exception as e:
-                logger.error(f"Error registering resource {resource.resourceName}: {str(e)}")
-                continue
+                logger.error(f"Error updating load {load_id} with VTN ID: {e}")
 
-        logger.info(f"Successfully registered {successful_registrations}/{total_resources} VEN Resources for VEN '{ven_id}'")
+        # Return statistics
+        stats = {
+            "success": True,
+            "ven_id": ven_id,
+            "total_loads": total_loads,
+            "registered": registered_count,
+            "failed": failed_count,
+            "vtn_ids_mapped": len(vtn_resource_ids)
+        }
 
-        return successful_registrations > 0
+        logger.info(f"Registration complete for VEN '{ven_id}': {registered_count}/{total_loads} loads registered")
+
+        return stats
+
 
     async def create_test_event(self) -> str:
         """Create a test demand response event"""
@@ -718,14 +1119,19 @@ class VENManager:
         total_resources_processed = 0
 
         for ven in self.vens.values():
-            #if not ven.credentials:
-            #    logger.info(f"Skipping VEN {ven.config.ven_name} - not registered")
-            #    continue
+            # Always recreate session to ensure it's bound to current event loop
+            # This is necessary because the scheduler runs tasks in a new event loop
+            logger.debug(f"Recreating session for VEN {ven.config.ven_name} in current event loop")
 
-            # Ensure VEN has a valid session in current event loop
-            if ven.session is None or ven.session.closed:
-                logger.debug(f"Creating new session for VEN {ven.config.ven_name}")
-                ven.session = aiohttp.ClientSession()
+            # Close old session if it exists (suppress all errors)
+            if ven.session is not None:
+                try:
+                    await ven.session.close()
+                except Exception:
+                    pass
+
+            # Create new session in current event loop
+            ven.session = aiohttp.ClientSession()
 
             logger.info(f"Collecting meter data for VEN: {ven.config.ven_name}")
 
@@ -935,21 +1341,33 @@ def load_ven_resources_from_sqlite(ven_id: str, db_path: str = "./config/resourc
         return []
 
 
-async def sample_registration(vtn_url="http://localhost:8000", bearer_token:str=None, db_path: str = "./config/resources.db", limit_vens: int = None, delay_between_resources: float = 0.1):
+async def sample_registration(vtn_url="http://localhost:8000", bearer_token: str = None,
+                             db_path: str = "./config/resources.db", limit_vens: int = None,
+                             batch_size: int = 50, delay_between_batches: float = 0.5):
     """
-    Register VENs and their resources from SQLite database with VTN server.
+    Register VENs and their load resources from SQLite database with VTN server.
+
+    This function:
+    1. Loads VENs from the database
+    2. For each VEN, loads all resources and their associated loads
+    3. Registers each load as a separate resource with the VTN
+    4. Uses parallel registration for better performance
+    5. Updates the loads table with VTN-assigned resource IDs
 
     Args:
         vtn_url: Base URL of the VTN server
         bearer_token: Authentication token for VTN API
         db_path: Path to the SQLite database containing resources
         limit_vens: Optional limit on number of VENs to register (for testing)
-        delay_between_resources: Delay in seconds between resource registrations (default: 0.1)
+        batch_size: Number of loads to register in parallel per batch (default: 50)
+        delay_between_batches: Delay between batches to avoid overwhelming server (default: 0.5s)
     """
-    logger.info("EnergyDesk OpenADR 3.0.1 VEN Client - Sample Registration")
-    logger.info("="*60)
+    logger.info("EnergyDesk OpenADR 3.0.1 VEN Client - Load Registration (Parallel)")
+    logger.info("=" * 60)
     logger.info(f"VTN URL: {vtn_url}")
     logger.info(f"Database: {db_path}")
+    logger.info(f"Batch size: {batch_size}")
+    logger.info(f"Delay between batches: {delay_between_batches}s")
 
     # Initialize VEN manager
     manager = VENManager(vtn_base_url=vtn_url, bearer_token=bearer_token)
@@ -971,59 +1389,58 @@ async def sample_registration(vtn_url="http://localhost:8000", bearer_token:str=
 
     # Track statistics
     total_vens_registered = 0
-    total_resources_registered = 0
+    total_loads_registered = 0
+    total_loads_failed = 0
     failed_vens = []
 
     try:
-        # Register each VEN and its resources
-        logger.info(f"\nStep 2: Registering {len(vens)} VENs and their resources...")
-        logger.info("-"*60)
+        # Register each VEN and its load resources in parallel
+        logger.info(f"\nStep 2: Registering {len(vens)} VENs and their loads...")
+        logger.info("-" * 60)
 
         for idx, ven_id in enumerate(vens, 1):
             try:
                 logger.info(f"\n[{idx}/{len(vens)}] Processing VEN: {ven_id}")
-
-                # Load resources for this VEN
-                resources_of_ven = load_ven_resources_from_sqlite(ven_id, db_path)
-
-                if not resources_of_ven:
-                    logger.warning(f"  No resources found for VEN '{ven_id}', skipping...")
-                    continue
-
-                logger.info(f"  Found {len(resources_of_ven)} resources for VEN '{ven_id}'")
 
                 # Register the VEN
                 logger.info(f"  Registering VEN '{ven_id}'...")
                 await manager.register_load_ven(ven_id)
                 total_vens_registered += 1
 
-                # Convert resources to dictionary
-                resource_map: Dict[str, Resource] = {}
-                for resource in resources_of_ven:
-                    resource_map[resource.resourceID] = resource
+                # Register loads for this VEN in parallel batches
+                logger.info(f"  Registering loads for VEN '{ven_id}' in parallel...")
+                stats = await manager.register_loads_parallel(
+                    ven_id=ven_id,
+                    batch_size=batch_size,
+                    delay_between_batches=delay_between_batches,
+                    db_path=db_path
+                )
 
-                # Register resources for this VEN
-                logger.info(f"  Registering {len(resource_map)} resources for VEN '{ven_id}'...")
-                success = await manager.register_resources(ven_id, resource_map, delay_between_resources)
-
-                if success:
-                    total_resources_registered += len(resource_map)
-                    logger.info(f"  ✓ Successfully registered VEN '{ven_id}' with {len(resource_map)} resources")
+                if stats['success']:
+                    total_loads_registered += stats['registered']
+                    total_loads_failed += stats['failed']
+                    logger.info(f"  ✓ Successfully registered {stats['registered']}/{stats['total_loads']} loads for VEN '{ven_id}'")
+                    if stats['failed'] > 0:
+                        logger.warning(f"  ⚠ {stats['failed']} loads failed to register")
                 else:
-                    logger.warning(f"  ⚠ VEN '{ven_id}' registered but some resources may have failed")
+                    logger.error(f"  ✗ Failed to register loads for VEN '{ven_id}': {stats.get('error', 'Unknown error')}")
+                    failed_vens.append((ven_id, stats.get('error', 'Unknown error')))
 
             except Exception as e:
                 logger.error(f"  ✗ Error processing VEN '{ven_id}': {str(e)}")
+                import traceback
+                traceback.print_exc()
                 failed_vens.append((ven_id, str(e)))
                 continue
 
         # Print summary
-        logger.info("\n" + "="*60)
+        logger.info("\n" + "=" * 60)
         logger.info("REGISTRATION SUMMARY")
-        logger.info("="*60)
+        logger.info("=" * 60)
         logger.info(f"Total VENs processed:          {len(vens)}")
         logger.info(f"VENs successfully registered:  {total_vens_registered}")
-        logger.info(f"Resources registered:          {total_resources_registered}")
+        logger.info(f"Total loads registered:        {total_loads_registered}")
+        logger.info(f"Total loads failed:            {total_loads_failed}")
         logger.info(f"Failed VENs:                   {len(failed_vens)}")
 
         if failed_vens:
@@ -1031,7 +1448,7 @@ async def sample_registration(vtn_url="http://localhost:8000", bearer_token:str=
             for ven_id, error in failed_vens:
                 logger.info(f"  - {ven_id}: {error}")
 
-        logger.info("="*60 + "\n")
+        logger.info("=" * 60 + "\n")
 
     except Exception as e:
         logger.error(f"Application error: {str(e)}")
