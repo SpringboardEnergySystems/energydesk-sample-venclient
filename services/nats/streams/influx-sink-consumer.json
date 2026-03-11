@@ -1,0 +1,10 @@
+{
+  "durable_name": "INFLUX_SINK",
+  "filter_subject": "evt.modus.>",
+  "ack_policy": "explicit",
+  "deliver_policy": "all",
+  "replay_policy": "instant",
+  "max_deliver": 10,
+  "backoff": [1000000000, 5000000000, 30000000000]
+}
+

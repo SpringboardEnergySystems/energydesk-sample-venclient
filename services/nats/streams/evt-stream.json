@@ -1,0 +1,8 @@
+{
+  "name": "EVT",
+  "subjects": ["evt.>"],
+  "retention": "limits",
+  "storage": "file",
+  "max_age": 604800000000000,
+  "num_replicas": 1
+}

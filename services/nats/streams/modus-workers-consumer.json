@@ -1,0 +1,11 @@
+{
+  "durable_name": "MODUS_WORKERS",
+  "filter_subject": "cmd.modus.>",
+  "ack_policy": "explicit",
+  "deliver_policy": "all",
+  "replay_policy": "instant",
+  "max_deliver": 10,
+  "ack_wait": 30000000000,
+  "backoff": [1000000000, 5000000000, 30000000000]
+}
+

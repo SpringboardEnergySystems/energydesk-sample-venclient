@@ -1,0 +1,8 @@
+{
+  "name": "CMD",
+  "subjects": ["cmd.modus.>"],
+  "retention": "workqueue",
+  "storage": "file",
+  "max_age": 604800000000000,
+  "num_replicas": 1
+}

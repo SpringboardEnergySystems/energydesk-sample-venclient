@@ -1,0 +1,82 @@
+git+https://github.com/SpringboardEnergySystems/energydesk-python-sdk.git@develop
+
+# FastAPI and web framework dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6  # For file uploads
+jinja2>=3.1.2  # For template rendering
+gunicorn
+
+# OIDC Authentication
+authlib>=1.2.1
+itsdangerous>=2.1.2
+starlette>=0.27.0
+
+# Database
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.9
+alembic>=1.12.0  # For database migrations
+influxdb==5.3.2
+influxdb-client>=1.48.0
+
+# Optimization
+pulp>=2.7.0               # LP/MIP optimizer (CBC solver bundled)
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+tables
+hmmlearn
+h5py
+matplotlib
+pendulum
+plotly
+
+# Utilities
+python-dotenv>=1.0.0
+django-environ>=0.11.2
+apscheduler
+croniter
+pyyaml
+thefuzz
+schedule==1.2.2
+
+# Communication
+aiohttp>=3.9.0
+httpx
+paho-mqtt
+kafka-python
+#signalr-client
+paramiko==2.11.0
+pysftp==0.2.9
+
+# Django/Flask utilities
+flask
+flask-restful
+#jsonfield
+markdownify
+#django-markdownify
+
+# Other utilities
+#zope
+rauth
+pykka
+shapely
+unittest-xml-reporting
+
+# Logging
+python-logstash==0.4.8
+python-json-logger>=2.0.7
+
+flatten_json
+
+dash
+
+openai  # For OpenAI GPT API
+mcp  # Model Context Protocol for AI tool integration
+
+jsonfield
+signalr-client
+zope
+
+nats-py==2.0.0

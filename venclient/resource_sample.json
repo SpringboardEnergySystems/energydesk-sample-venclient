@@ -1,0 +1,105 @@
+ {
+  "id": "b9cae78e-d7c9-4ba8-b103-34d2189b20ec",
+  "ven_id": "rpi-ven-001",
+  "resource_name": "Household 1",
+  "resource_type": "Demand Response",
+  "created_date": "2026-01-13T07:56:52.408902",
+  "attributes": [
+    {
+      "resource_id": "1",
+      "attribute_name": "meter_point_id",
+      "attribute_type": "meter_point_id",
+      "attribute_values": [
+        "707057500054134059"
+      ]
+    },
+    {
+      "resource_id": "b9cae78e-d7c9-4ba8-b103-34d2189b20ec",
+      "attribute_name": "connection",
+      "attribute_type": "connection",
+      "attribute_values": [
+        "modbus"
+      ]
+    },
+    {
+      "resource_id": "b9cae78e-d7c9-4ba8-b103-34d2189b20ec",
+      "attribute_name": "p_max_kw",
+      "attribute_type": "p_max_kw",
+      "attribute_values": [
+        "6.0"
+      ]
+    },
+    {
+      "id": "8ac69d95-0b1e-4715-a08b-bccc0b02830d",
+      "resource_id": "b9cae78e-d7c9-4ba8-b103-34d2189b20ec",
+      "attribute_name": "p_min_kw",
+      "attribute_type": "p_min_kw",
+      "attribute_values": [
+        "-6.0"
+      ]
+    },
+    {
+      "id": "5bfd097b-09f1-41de-827c-c1ecb0829e87",
+      "resource_id": "b9cae78e-d7c9-4ba8-b103-34d2189b20ec",
+      "attribute_name": "e_max_kwh",
+      "attribute_type": "e_max_kwh",
+      "attribute_values": [
+        "24.0"
+      ]
+    },
+    {
+      "id": "104c1d79-2603-4a74-b501-4b2fc65f65b6",
+      "resource_id": "b9cae78e-d7c9-4ba8-b103-34d2189b20ec",
+      "attribute_name": "e_min_kwh",
+      "attribute_type": "e_min_kwh",
+      "attribute_values": [
+        "0.0"
+      ]
+    },
+    {
+      "id": "90367508-72b0-4edc-bdae-e3a7ea9122da",
+      "resource_id": "b9cae78e-d7c9-4ba8-b103-34d2189b20ec",
+      "attribute_name": "address",
+      "attribute_type": "address",
+      "attribute_values": [
+        "Testveien 1, 1234 Teststed"
+      ]
+    },
+    {
+      "id": "829d9d30-df24-4aa5-b69d-89cc91fed510",
+      "resource_id": "b9cae78e-d7c9-4ba8-b103-34d2189b20ec",
+      "attribute_name": "latitude",
+      "attribute_type": "latitude",
+      "attribute_values": [
+        "60.123456"
+      ]
+    },
+    {
+      "id": "bf1f24d3-e728-4c1c-b321-e4274599f710",
+      "resource_id": "b9cae78e-d7c9-4ba8-b103-34d2189b20ec",
+      "attribute_name": "longitude",
+      "attribute_type": "longitude",
+      "attribute_values": [
+        "10.123456"
+      ]
+    },
+    {
+      "id": "6bc6c8e5-e64c-42c3-b522-c845814676bd",
+      "resource_id": "b9cae78e-d7c9-4ba8-b103-34d2189b20ec",
+      "attribute_name": "enabled",
+      "attribute_type": "enabled",
+      "attribute_values": [
+        "True"
+      ]
+    },
+    {
+      "id": "edb70a93-ec9f-4d16-9348-cf4d5e5c7b8a",
+      "resource_id": "b9cae78e-d7c9-4ba8-b103-34d2189b20ec",
+      "attribute_name": "status",
+      "attribute_type": "prequalification",
+      "attribute_values": [
+        "PENDING"
+      ]
+    }
+  ]
+}
